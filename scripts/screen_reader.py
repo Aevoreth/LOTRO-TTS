@@ -124,6 +124,12 @@ CHAT_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+RADAR_COORD_RE = re.compile(
+    r"\b\d{1,3}[.,]\d+\s*[NS]\b.*?\b\d{1,3}[.,]\d+\s*[EWO]\b|"
+    r"^\s*\d{1,3}[.,]\d+\s*[NS]\s*[,;]?\s*\d{1,3}[.,]\d+\s*[EWO]\s*$",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class PlayerInfo:
@@ -365,7 +371,7 @@ class LotroScreenReader:
     @staticmethod
     def _is_chat_or_hud_noise(b: Dict[str, Any]) -> bool:
         t = b["text"].strip()
-        if CHAT_LINE_RE.search(t):
+        if CHAT_LINE_RE.search(t) or RADAR_COORD_RE.search(t):
             return True
         n = b["norm"]
         if n in ("general", "combat", "ims", "say", "readaloud", "x", "freepeoples", "freievolker", "peupleslibres"):
@@ -379,6 +385,7 @@ class LotroScreenReader:
             return boxes
 
         boxes_by_y = sorted(boxes, key=lambda b: (b["center_y"], b["x_min"]))
+        obj_hdrs = [b for b in boxes_by_y if cls._is_objective_hdr(b)]
         used = [False] * len(boxes_by_y)
         merged: List[Dict[str, Any]] = []
 
@@ -410,13 +417,24 @@ class LotroScreenReader:
                             or cls._is_hud_alert(nxt)
                         ):
                             continue
+                        # Never merge across the left-dialogue / right-objective column boundary
+                        crosses_col_divider = any(
+                            oh["y_min"] - 40 <= cur["center_y"] <= oh["y_min"] + 460
+                            and min(cur["x_min"], nxt["x_min"]) < (oh["x_min"] - 12 - 20)
+                            and max(cur["x_max"], nxt["x_max"]) >= (oh["x_min"] - 12)
+                            for oh in obj_hdrs
+                        )
+                        if crosses_col_divider:
+                            continue
+
                         min_h = min(cur["h"], nxt["h"])
                         max_h = max(cur["h"], nxt["h"])
                         if (min_h / float(max_h)) >= 0.70 and abs(cur["center_y"] - nxt["center_y"]) <= min_h * 0.42:
+                            max_gap = min_h * 1.25 if (cur["text"].isupper() and nxt["text"].isupper()) else min_h * 0.95
                             # Merge only tight word gaps on the exact same baseline (never jump across columns)
-                            if -min_h * 0.25 <= (nxt["x_min"] - cur["x_max"]) <= min_h * 1.35:
+                            if -min_h * 0.25 <= (nxt["x_min"] - cur["x_max"]) <= max_gap:
                                 combined_text = f"{cur['text']} {nxt['text']}".strip()
-                            elif -min_h * 0.25 <= (cur["x_min"] - nxt["x_max"]) <= min_h * 1.35:
+                            elif -min_h * 0.25 <= (cur["x_min"] - nxt["x_max"]) <= max_gap:
                                 combined_text = f"{nxt['text']} {cur['text']}".strip()
                             else:
                                 continue
@@ -562,7 +580,7 @@ class LotroScreenReader:
                     offset=(cx1, cy1),
                     player_info=player_info,
                 )
-                if res.get("final_text") and res.get("title"):
+                if res.get("final_text") and (res.get("title") or res.get("window_box")):
                     print(f"[LotroScreenReader] Fast-path cropped dialog scan: '{res['title']}' ({lang.upper()})")
                     return res
 
@@ -646,7 +664,6 @@ class LotroScreenReader:
 
         if cropped_fast_path and any(self._is_hud_alert(b) for b in boxes):
             return empty_res
-        dark_header_bg = (float(img[:min(h, 90), :].mean()) < 95.0) if cropped_fast_path else False
 
         # Identify Chat Window bounding region (if 2+ chat lines exist) to prevent wrapped chat continuation lines
         chat_boxes = [b for b in boxes if CHAT_LINE_RE.search(b["text"]) and not re.search(r"\b\d+\s*FPS\b", b["text"], re.IGNORECASE)]
@@ -669,19 +686,22 @@ class LotroScreenReader:
         obj_boxes = [b for b in boxes if self._is_objective_hdr(b) and not is_inside_chat(b)]
         btn_boxes = [b for b in boxes if self._is_dialog_btn(b) and not is_inside_chat(b)]
 
+        non_ctrl_boxes = [
+            bx for bx in boxes
+            if not (
+                self._is_hud_alert(bx)
+                or self._is_level_meta(bx)
+                or self._is_objective_hdr(bx)
+                or self._is_dialog_btn(bx)
+                or self._is_chat_or_hud_noise(bx)
+                or is_inside_chat(bx)
+            )
+        ]
+
         best_candidate = None
         best_score = -1e9
 
-        for b in boxes:
-            if (
-                self._is_hud_alert(b)
-                or self._is_level_meta(b)
-                or self._is_objective_hdr(b)
-                or self._is_dialog_btn(b)
-                or self._is_chat_or_hud_noise(b)
-                or is_inside_chat(b)
-            ):
-                continue
+        for b in non_ctrl_boxes:
             if len(b["norm"]) < 3:
                 continue
 
@@ -704,12 +724,19 @@ class LotroScreenReader:
             win_left_est = max(0.0, tx - half_w)
             win_right_est = min(float(w), tx + half_w)
 
-            # A dialog title bar is ALWAYS at the top of its dialog: reject if a QUEST LEVEL or NEXT OBJECTIVE
-            # header sits right above candidate b inside the same horizontal window
+            # A dialog title bar is ALWAYS at the top of its dialog: reject if a QUEST LEVEL header sits above b,
+            # or if a NEXT OBJECTIVE header sits above/left of b (allow Line 1 in the left column beside NEXT OBJECTIVE).
             has_header_above = any(
                 win_left_est <= hdr["center_x"] <= win_right_est
                 and 0 < (b["y_min"] - hdr["y_min"]) <= max_win_h * 0.85
-                for hdr in (level_boxes + obj_boxes)
+                for hdr in level_boxes
+            ) or any(
+                win_left_est <= hdr["center_x"] <= win_right_est
+                and (
+                    (b["center_x"] >= hdr["x_min"] - 30 and 0 < (b["y_min"] - hdr["y_min"]) <= max_win_h * 0.85)
+                    or (b["center_x"] < hdr["x_min"] - 30 and (b["y_min"] - hdr["y_max"]) > max(45.0, b["h"] * 1.8))
+                )
+                for hdr in obj_boxes
             )
             if has_header_above:
                 continue
@@ -723,36 +750,82 @@ class LotroScreenReader:
             if require_anchors and has_distant_dialog_below:
                 continue
 
+            clean_t = re.sub(r"^[^\w\s]+|[^\w\s]+$", "", b["text"]).strip()
+            q_id = None
+            db_title = None
+            if self.db_path.exists():
+                matched_qid, matched_raw_t = self._quick_match_title(clean_t, lang=lang)
+                if matched_qid:
+                    q_id = matched_qid
+                    db_title = matched_raw_t
+
+            # Detect whether another left-aligned line already sits directly above b (disqualifies Lines 2..N)
+            has_line_above = any(
+                prev is not b
+                and 0 < (b["y_min"] - prev["y_min"]) <= max(48.0, b["h"] * 2.3)
+                and abs(prev["x_min"] - b["x_min"]) <= max(45.0, b["h"] * 1.8)
+                for prev in non_ctrl_boxes
+            )
+
             local_levels = [
                 a for a in level_boxes
                 if win_left_est <= a["center_x"] <= win_right_est
                 and 0 <= a["y_min"] - b["y_min"] <= max(130.0, b["h"] * 4.5)
             ]
-            local_objs = [
+            max_obj_dy = max(240.0, b["h"] * 8.5) if (local_levels or q_id) else max(115.0, b["h"] * 5.0)
+            local_objs_above = [
                 a for a in obj_boxes
                 if tx - b["w"] * 0.35 <= a["center_x"] <= win_right_est
-                and 0 < a["y_min"] - b["y_min"] <= max(240.0, b["h"] * 8.5)
+                and 0 < a["y_min"] - b["y_min"] <= max_obj_dy
             ]
+            local_objs_beside = (
+                [
+                    a for a in obj_boxes
+                    if b["x_max"] <= a["x_min"] + 20
+                    and (a["x_min"] - b["x_min"]) <= max(540.0, b["w"] * 2.5)
+                    and -b["h"] * 1.4 <= (a["y_min"] - b["y_min"]) <= b["h"] * 1.4
+                ]
+                if not has_line_above
+                else []
+            )
+            local_objs = local_objs_above or local_objs_beside
             local_btns = [
                 a for a in btn_boxes
                 if win_left_est <= a["center_x"] <= win_right_est
                 and b["h"] * 4.0 < a["y_min"] - b["y_min"] <= max_win_h
             ]
 
+            has_continuation_below = (
+                not b["text"].isupper()
+                and any(
+                    nxt is not b
+                    and 0 <= (nxt["y_min"] - b["y_max"]) <= max(22.0, b["h"] * 0.95)
+                    and abs(nxt["x_min"] - b["x_min"]) <= 28
+                    for nxt in non_ctrl_boxes
+                )
+            )
+            b_is_body_first_line = bool(
+                q_id is None
+                and not local_levels
+                and (
+                    (local_objs and (min(a["y_min"] for a in local_objs) - b["y_min"]) < b["h"] * 1.25)
+                    or b["text"].lstrip().startswith(("'", '"', "«", "„", "‘", "“"))
+                    or has_continuation_below
+                )
+            )
+
             # Determine vertical and horizontal bounds of left-column dialogue text for this candidate
-            body_top = max([b["y_max"]] + [a["y_max"] for a in local_levels])
+            body_top = (
+                (b["y_min"] - 4)
+                if b_is_body_first_line
+                else max([b["y_max"]] + [a["y_max"] for a in local_levels])
+            )
             body_bottom = min([a["y_min"] for a in local_btns]) if local_btns else min(float(h), b["y_min"] + max_win_h * 0.88)
             right_split_x = min([a["x_min"] for a in local_objs]) - 10.0 if local_objs else (tx + half_w * 0.18 if require_anchors else w * 0.58)
 
             body_lines = [
-                ln for ln in boxes
-                if ln is not b
-                and not self._is_hud_alert(ln)
-                and not self._is_level_meta(ln)
-                and not self._is_objective_hdr(ln)
-                and not self._is_dialog_btn(ln)
-                and not self._is_chat_or_hud_noise(ln)
-                and not is_inside_chat(ln)
+                ln for ln in non_ctrl_boxes
+                if (b_is_body_first_line or ln is not b)
                 and ln["y_min"] >= body_top - 4
                 and ln["y_max"] <= body_bottom + 4
                 and ln["x_min"] >= win_left_est - 20
@@ -775,12 +848,16 @@ class LotroScreenReader:
 
             # Score candidate
             score = 0.0
+            if has_line_above and q_id is None:
+                score -= 120.0
+            if b_is_body_first_line:
+                score -= 40.0
             if local_levels:
                 min_dy = min(a["y_min"] - b["y_max"] for a in local_levels)
                 score += 140.0 - max(0.0, min_dy) * 0.5
             if local_objs:
-                min_obj_dy = min(a["y_min"] - b["y_max"] for a in local_objs)
-                score += 120.0 - max(0.0, min_obj_dy) * 0.25
+                min_obj_dy = max(0.0, min(a["y_min"] - b["y_max"] for a in local_objs))
+                score += 120.0 - min_obj_dy * 0.25
             if local_btns:
                 score += 90.0
             if is_inst_prefix:
@@ -791,34 +868,29 @@ class LotroScreenReader:
                 score += min(30.0, len(body_lines) * 8.0)
 
             # Penalize if another non-noise box sits between candidate b and the dialog's level/objective header
-            anchor_top_y = min(
-                [a["y_min"] for a in local_levels] + [a["y_min"] for a in local_objs] + [body_top + 1000.0]
-            )
-            intervening = sum(
-                1 for other in boxes
-                if other is not b
-                and b["y_max"] < other["y_min"]
-                and other["y_max"] < anchor_top_y
-                and win_left_est <= other["center_x"] <= win_right_est
-            )
-            score -= intervening * 60.0
+            if not b_is_body_first_line:
+                anchor_top_y = min(
+                    [a["y_min"] for a in local_levels] + [a["y_min"] for a in local_objs] + [body_top + 1000.0]
+                )
+                intervening = sum(
+                    1 for other in boxes
+                    if other is not b
+                    and b["y_max"] < other["y_min"]
+                    and other["y_max"] < anchor_top_y
+                    and win_left_est <= other["center_x"] <= win_right_est
+                )
+                score -= intervening * 60.0
 
-            clean_t = re.sub(r"^[^\w\s]+|[^\w\s]+$", "", b["text"]).strip()
-            q_id = None
-            db_title = None
-            if self.db_path.exists():
-                matched_qid, matched_raw_t = self._quick_match_title(clean_t, lang=lang)
-                if matched_qid:
-                    q_id = matched_qid
-                    db_title = matched_raw_t
-                    score += 160.0
+            if q_id:
+                score += 160.0
 
             # Never select a window candidate that yields zero readable text (neither DB match nor body lines)
             if not q_id and not body_lines:
                 continue
 
-            # In single-pass fast-path crop mode, still verify the cropped region still holds an active dialog
-            if cropped_fast_path and not (has_dialog_anchor or q_id or dark_header_bg):
+            # In single-pass fast-path crop mode, require a real dialog anchor or DB quest match
+            # so moving a dialog on a dark background immediately invalidates the stale crop cache
+            if cropped_fast_path and not (has_dialog_anchor or q_id):
                 continue
 
             # In pre-cropped standalone dialog mode, favor top-center box
@@ -827,13 +899,13 @@ class LotroScreenReader:
 
             if score > best_score:
                 best_score = score
-                best_candidate = (b, clean_t, local_levels, local_objs, local_btns, body_lines, q_id, db_title)
+                best_candidate = (b, clean_t, local_levels, local_objs, local_btns, body_lines, q_id, db_title, b_is_body_first_line)
 
         if best_candidate is None:
             return empty_res
 
-        title_box, clean_title, local_levels, local_objs, local_btns, body_lines, q_id, db_title = best_candidate
-        final_title = db_title or clean_title
+        title_box, clean_title, local_levels, local_objs, local_btns, body_lines, q_id, db_title, b_is_body_first_line = best_candidate
+        final_title = "" if (b_is_body_first_line and q_id is None) else (db_title or clean_title)
         is_instance = bool(re.search(r"^(INSTANZ|INSTANCE)\b", final_title, re.IGNORECASE))
         window_type = "instance" if is_instance else "quest"
 
@@ -874,6 +946,8 @@ class LotroScreenReader:
         ox, oy = offset
         win_x1 = int(min(c["x_min"] for c in dialog_constituents)) + ox
         win_y1 = int(min(c["y_min"] for c in dialog_constituents)) + oy
+        if b_is_body_first_line:
+            win_y1 = max(0, win_y1 - int(title_box["h"] * 2.4))
         win_x2 = int(max(c["x_max"] for c in dialog_constituents)) + ox
         win_y2 = int(max(c["y_max"] for c in dialog_constituents)) + oy
         # Ensure horizontal width covers full two-column dialog around centered title
@@ -1059,7 +1133,7 @@ class LotroScreenReader:
 
         self._init_quest_index()
         norm_query = normalize_text_for_matching(title)
-        if not norm_query or len(norm_query) < 3:
+        if (not norm_query or len(norm_query) < 3) and (not dialog_text or len(dialog_text.strip()) < 20):
             return None, None, None, None, None
 
         lang_clean = lang.lower().strip()
@@ -1070,14 +1144,15 @@ class LotroScreenReader:
         candidate_matches: List[Tuple[int, str]] = []
 
         # 1. O(1) Exact normalized match on preferred language, then fallback languages
-        for l_key in lang_order:
-            exact = self._exact_titles.get(l_key, {}).get(norm_query)
-            if exact:
-                candidate_matches = list(exact)
-                break
+        if norm_query and len(norm_query) >= 3:
+            for l_key in lang_order:
+                exact = self._exact_titles.get(l_key, {}).get(norm_query)
+                if exact:
+                    candidate_matches = list(exact)
+                    break
 
         # 2. Length-guarded substring match (handles slight OCR edge clipping without false-matching short words)
-        if not candidate_matches and len(norm_query) >= 6:
+        if not candidate_matches and norm_query and len(norm_query) >= 6:
             qlen = len(norm_query)
             best_len = 0
             for l_key in lang_order:
@@ -1095,7 +1170,7 @@ class LotroScreenReader:
                     break
 
         # 3. Trigram-filtered fuzzy match (~1.5ms) for small-caps OCR substitutions (e.g. 'YOURSFLF' -> 'YOURSELF')
-        if not candidate_matches and len(norm_query) >= 6:
+        if not candidate_matches and norm_query and len(norm_query) >= 6:
             qlen = len(norm_query)
             q_tri = self._trigrams(norm_query)
             min_shared = max(1, int(len(q_tri) * 0.42))
@@ -1171,6 +1246,72 @@ class LotroScreenReader:
                     return best_q
             except Exception as e:
                 print(f"[LotroScreenReader] NPC fallback error: {e}", file=sys.stderr)
+
+        # 4b. Exact Opening-Phrase Fallback (when title bar is illegible or omitted, e.g. dark-blue instance headers)
+        # Only matches if the first 5-8 consecutive words appear in exact order in the DB text;
+        # otherwise falls back cleanly to reading the full OCR text.
+        if not candidate_matches and dialog_text and len(dialog_text.strip()) >= 20:
+            try:
+                opening_tokens = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9'-]+", dialog_text)[:12]
+                phrases: List[Tuple[str, str]] = []
+                if len(opening_tokens) >= 6:
+                    phrases.append(("%".join(opening_tokens[:6]), normalize_text_for_matching("".join(opening_tokens[:6]))))
+                elif len(opening_tokens) >= 5:
+                    phrases.append(("%".join(opening_tokens[:5]), normalize_text_for_matching("".join(opening_tokens[:5]))))
+                if len(opening_tokens) >= 8:
+                    phrases.append(("%".join(opening_tokens[2:8]), normalize_text_for_matching("".join(opening_tokens[2:8]))))
+
+                if phrases:
+                    conn = self._get_db_conn()
+                    if conn is not None:
+                        cur = conn.cursor()
+                        text_col = f"text_{lang_clean}"
+                        rows = []
+                        seen_qt_ids: Set[str] = set()
+                        for like_pat, _ in phrases:
+                            cur.execute(
+                                f"""
+                                SELECT q.id, q.title_{lang_clean}, q.title_en, qt.{text_col}, qt.text_en,
+                                       qt.npc_id, qt.id, qt.text_type,
+                                       n.name_de, n.name_en, n.name_fr, n.name_es
+                                FROM Quest_Texts qt
+                                JOIN Quests q ON q.id = qt.quest_id
+                                LEFT JOIN NPCs n ON qt.npc_id = n.id
+                                WHERE qt.text_type IN ('bestower', 'dialog', 'description')
+                                  AND qt.{text_col} LIKE ?
+                                LIMIT 15
+                                """,
+                                (f"%{like_pat}%",),
+                            )
+                            for r in cur.fetchall():
+                                if r[6] not in seen_qt_ids:
+                                    seen_qt_ids.add(r[6])
+                                    rows.append(r)
+
+                        norm_ocr_head = normalize_text_for_matching(dialog_text)[:100]
+                        best_q = None
+                        best_sim = 0.0
+                        for qid, q_title, q_title_en, q_text, q_text_en, q_npc_id, q_text_id, q_type, n_de, n_en, n_fr, n_es in rows:
+                            cand_text = q_text or q_text_en or ""
+                            clean_db = re.sub(r"\$\{[^}]*\}", "", cand_text)
+                            norm_db_full = normalize_text_for_matching(clean_db)
+                            norm_db_head = norm_db_full[:100]
+                            if not norm_ocr_head or not norm_db_head:
+                                continue
+                            has_exact_opening = any(p_norm and p_norm in norm_db_full[: len(p_norm) + 40] for _, p_norm in phrases)
+                            sim = SequenceMatcher(None, norm_ocr_head, norm_db_head).ratio()
+                            if (has_exact_opening or sim >= 0.78) and sim > best_sim:
+                                best_sim = sim
+                                raw_t = q_title or q_title_en
+                                pname = self._extract_player_name_from_ocr(cand_text, dialog_text)
+                                matched_text = self._format_player_placeholders(
+                                    cand_text, lang_clean, player_name=pname, player_info=player_info
+                                )
+                                best_q = (qid, raw_t, matched_text, q_npc_id, q_text_id)
+                        if best_q:
+                            return best_q
+            except Exception as e:
+                print(f"[LotroScreenReader] Dialogue fallback error: {e}", file=sys.stderr)
 
         if not candidate_matches:
             return None, None, None, None, None

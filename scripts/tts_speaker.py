@@ -187,6 +187,7 @@ class LotroSpeaker:
         narrator_mode: bool = False,
         narrator_voice: str = "man_male_1",
         volume: int = 80,
+        speed: int = 100,
         active_lang: str | None = None,
     ):
         self.base_dir = Path(__file__).resolve().parent.parent
@@ -195,9 +196,15 @@ class LotroSpeaker:
         self.narrator_mode = bool(narrator_mode)
         self.narrator_voice = str(narrator_voice).strip() if narrator_voice else "man_male_1"
         self.volume = max(0, min(100, int(volume)))
+        self.speed = max(50, min(200, int(speed)))
         self.active_lang = active_lang.lower().strip() if active_lang else None
         self._cached_vol_scale = max(0.0, min(1.0, float(self.volume) / 100.0))
-        self._config_vol_mtime = None
+        self._cached_speed_factor = max(0.5, min(2.0, float(self.speed) / 100.0))
+        cfg_file = self.base_dir / "config.json"
+        try:
+            self._config_vol_mtime = cfg_file.stat().st_mtime if cfg_file.exists() else None
+        except OSError:
+            self._config_vol_mtime = None
         self._db_local = threading.local()
 
         self.device = resolve_compute_device(device)
@@ -667,11 +674,13 @@ class LotroSpeaker:
             min_rate, max_rate = 11.5, 14.2
 
         effective_rate = max(min_rate, min(raw_rate, max_rate))
+        speed_factor = self._get_speed_factor()
+        effective_rate *= speed_factor
 
         # Add generous trailing breath headroom (+0.32s) so final syllables (-en, -er, -t)
         # have full room to decay naturally before the diffusion token window ends.
         est_duration = (target_w / effective_rate) + 0.32
-        return max(est_duration, 0.85)
+        return max(est_duration, 0.85 / max(speed_factor, 0.75))
 
     def _clean_generated_chunk(self, audio_tensor, sample_rate=24000):
         """
@@ -922,11 +931,15 @@ class LotroSpeaker:
                 cache_dir = self.base_dir / "cache" / "audio"
                 cache_dir.mkdir(parents=True, exist_ok=True)
 
+                # Refresh live config before hashing so speed slider changes immediately affect cache key
+                self._get_speed_factor()
+                speed_tag = f"_spd{self.speed}" if self.speed != 100 else ""
+
                 # Include reference audio mtime & transcription hash so modified voices automatically invalidate cache
                 ref_mtime = int(ref_audio.stat().st_mtime) if ref_audio.exists() else 0
                 ref_text_hash = hashlib.md5((ref_text or "").encode("utf-8")).hexdigest()[:8]
                 text_hash = hashlib.md5(
-                    f"{SPEAKER_ENGINE_VERSION}_{voice_id}_{ref_audio.name}_{ref_mtime}_{ref_text_hash}_{lang}_{text}".encode("utf-8")
+                    f"{SPEAKER_ENGINE_VERSION}_{voice_id}_{ref_audio.name}_{ref_mtime}_{ref_text_hash}_{lang}{speed_tag}_{text}".encode("utf-8")
                 ).hexdigest()
                 cached_wav = Path(output_path) if output_path else (cache_dir / f"{text_hash}.wav")
 
@@ -1118,7 +1131,7 @@ class LotroSpeaker:
 
     def _get_volume_scale(self) -> float:
         """
-        Reads volume (0-100) from config.json to apply real-time software audio scaling.
+        Reads volume (0-100) and speech_speed (50-200) from config.json to apply live settings.
         Caches file modification time for instant 0ms lookups.
         """
         config_path = self.base_dir / "config.json"
@@ -1132,9 +1145,18 @@ class LotroSpeaker:
                 vol = cfg.get("volume", self.volume)
                 self.volume = max(0, min(100, int(vol)))
                 self._cached_vol_scale = max(0.0, min(1.0, float(self.volume) / 100.0))
+                if "speech_speed" in cfg:
+                    spd = cfg.get("speech_speed", self.speed)
+                    self.speed = max(50, min(200, int(spd)))
+                    self._cached_speed_factor = max(0.5, min(2.0, float(self.speed) / 100.0))
             return self._cached_vol_scale
         except Exception:
             return self._cached_vol_scale
+
+    def _get_speed_factor(self) -> float:
+        """Returns the cached normalized speech speed multiplier (1.0 = 100%)."""
+        self._get_volume_scale()
+        return self._cached_speed_factor
 
     def play_memory_audio(self, audio_data, sample_rate=24000):
         """Plays float32 audio array directly from memory without touching the hard drive."""
@@ -1226,8 +1248,9 @@ if __name__ == "__main__":
     parser.add_argument("--lang", type=str, choices=["de", "en", "fr", "es", "it", "nl"], default="de", help="Language code")
     parser.add_argument("--output", type=str, default=None, help="Output wav file path")
     parser.add_argument("--volume", type=int, default=80, help="Volume percentage (0-100)")
+    parser.add_argument("--speed", type=int, default=100, help="Speech speed percentage (75-135, default: 100)")
     parser.add_argument("--device", type=str, choices=["auto", "cuda", "cpu"], default=None, help="Compute device (default: auto-detect cuda/cpu)")
 
     args = parser.parse_args()
-    speaker = LotroSpeaker(device=args.device, volume=args.volume, active_lang=args.lang)
+    speaker = LotroSpeaker(device=args.device, volume=args.volume, speed=args.speed, active_lang=args.lang)
     speaker.speak(args.text, npc_name_or_category=args.npc, lang=args.lang, output_path=args.output)

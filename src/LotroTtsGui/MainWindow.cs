@@ -48,6 +48,10 @@ namespace LotroTtsGui
         private volatile int currentVolume = 80;
         private CancellationTokenSource? volumeDebounceCts;
         private CancellationTokenSource? serviceVolumeWatcherCts;
+        private Slider sliderSpeed = null!;
+        private TextBlock lblSpeedTitle = null!;
+        private volatile int currentSpeed = 100;
+        private CancellationTokenSource? speedDebounceCts;
         private CheckBox chkMiddleMouse = null!;
         private CheckBox chkNarratorMode = null!;
         private ComboBox cmbNarratorVoice = null!;
@@ -150,6 +154,7 @@ namespace LotroTtsGui
             this.Closing += (s, e) =>
             {
                 try { volumeDebounceCts?.Cancel(); } catch (ObjectDisposedException) { }
+                try { speedDebounceCts?.Cancel(); } catch (ObjectDisposedException) { }
                 SaveConfig();
                 StopActiveProcess();
             };
@@ -416,12 +421,17 @@ namespace LotroTtsGui
             Grid.SetRow(chkMiddleMouse, 1);
             settingsPanel.Children.Add(chkMiddleMouse);
 
-            // Row 2: Narrator Mode Controls in a WrapPanel
+            // Row 2: Narrator Mode Controls (left) + Speech Speed Slider (right)
+            var row2Grid = new Grid
+            {
+                ColumnDefinitions = new ColumnDefinitions("3.2*,12,0.9*"),
+                Margin = new Thickness(0, 6, 0, 0)
+            };
+
             var narratorPanel = new WrapPanel
             {
                 Orientation = Orientation.Horizontal,
-                VerticalAlignment = VerticalAlignment.Center,
-                Margin = new Thickness(0, 6, 0, 0)
+                VerticalAlignment = VerticalAlignment.Center
             };
 
             chkNarratorMode = new CheckBox
@@ -441,7 +451,7 @@ namespace LotroTtsGui
 
             cmbNarratorVoice = new ComboBox
             {
-                Width = 240,
+                Width = 210,
                 IsEnabled = false,
                 FontSize = 12,
                 VerticalAlignment = VerticalAlignment.Center
@@ -450,9 +460,66 @@ namespace LotroTtsGui
 
             narratorPanel.Children.Add(chkNarratorMode);
             narratorPanel.Children.Add(cmbNarratorVoice);
+            Grid.SetColumn(narratorPanel, 0);
+            row2Grid.Children.Add(narratorPanel);
 
-            Grid.SetRow(narratorPanel, 2);
-            settingsPanel.Children.Add(narratorPanel);
+            var speedPanel = new StackPanel
+            {
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            lblSpeedTitle = new TextBlock
+            {
+                Text = "Speech Speed: 100%",
+                FontSize = 11.5,
+                Foreground = textMuted,
+                Margin = new Thickness(0, 0, 0, 2)
+            };
+            sliderSpeed = new Slider
+            {
+                Minimum = 75,
+                Maximum = 135,
+                Value = 100,
+                TickFrequency = 5,
+                IsSnapToTickEnabled = true,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            sliderSpeed.PropertyChanged += (s, e) =>
+            {
+                if (e.Property.Name == nameof(Slider.Value))
+                {
+                    int spd = Math.Clamp((int)(Math.Round(sliderSpeed.Value / 5.0) * 5), 75, 135);
+                    currentSpeed = spd;
+                    lblSpeedTitle.Text = $"Speech Speed: {spd}%";
+                    if (isLoadingConfig) return;
+
+                    try { speedDebounceCts?.Cancel(); } catch (ObjectDisposedException) { }
+                    var cts = new CancellationTokenSource();
+                    speedDebounceCts = cts;
+                    var token = cts.Token;
+
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await Task.Delay(120, token);
+                            if (token.IsCancellationRequested) return;
+                            Dispatcher.UIThread.Post(SaveConfig);
+                        }
+                        catch (OperationCanceledException) { }
+                        finally
+                        {
+                            cts.Dispose();
+                        }
+                    });
+                }
+            };
+            speedPanel.Children.Add(lblSpeedTitle);
+            speedPanel.Children.Add(sliderSpeed);
+            Grid.SetColumn(speedPanel, 2);
+            row2Grid.Children.Add(speedPanel);
+
+            Grid.SetRow(row2Grid, 2);
+            settingsPanel.Children.Add(row2Grid);
 
             Grid.SetColumn(settingsPanel, 0);
             configOuterGrid.Children.Add(settingsPanel);
@@ -764,6 +831,13 @@ namespace LotroTtsGui
                         lblVolumeTitle.Text = $"TTS Volume: {currentVolume}%";
                     }
 
+                    if (root.TryGetProperty("speech_speed", out var sp) && sp.TryGetInt32(out int spd))
+                    {
+                        currentSpeed = Math.Clamp((int)(Math.Round(spd / 5.0) * 5), 75, 135);
+                        sliderSpeed.Value = currentSpeed;
+                        lblSpeedTitle.Text = $"Speech Speed: {currentSpeed}%";
+                    }
+
                     if (root.TryGetProperty("stop_hotkey", out var sh) && !string.IsNullOrWhiteSpace(sh.GetString()))
                     {
                         stopHotkey = sh.GetString()!.ToLowerInvariant().Trim();
@@ -892,6 +966,7 @@ namespace LotroTtsGui
                 string ttsLang = GetSelectedCode(cmbTtsLang, "de");
                 string computeMode = GetSelectedCode(cmbComputeMode, "auto");
                 int volume = (int)sliderVolume.Value;
+                int speechSpeed = Math.Clamp((int)(Math.Round(sliderSpeed.Value / 5.0) * 5), 75, 135);
                 bool middleMouse = chkMiddleMouse?.IsChecked ?? true;
                 bool narratorMode = chkNarratorMode?.IsChecked ?? false;
                 string narratorVoice = GetSelectedVoiceId(cmbNarratorVoice, savedNarratorVoice);
@@ -918,6 +993,7 @@ namespace LotroTtsGui
                     tts_lang = ttsLang,
                     compute_mode = computeMode,
                     volume = volume,
+                    speech_speed = speechSpeed,
                     stop_hotkey = stopHotkey,
                     middle_mouse = middleMouse,
                     narrator_mode = narratorMode,
@@ -1591,17 +1667,18 @@ namespace LotroTtsGui
             string ttsLang = GetSelectedCode(cmbTtsLang, "de");
             string mode = GetSelectedCode(cmbComputeMode, "auto");
             int volume = (int)sliderVolume.Value;
+            int speed = Math.Clamp((int)(Math.Round(sliderSpeed.Value / 5.0) * 5), 75, 135);
             bool useMouse = chkMiddleMouse.IsChecked ?? true;
 
             bool narratorMode = chkNarratorMode.IsChecked ?? false;
             string narratorVoice = GetSelectedVoiceId(cmbNarratorVoice, savedNarratorVoice);
 
-            string args = $"-u \"scripts/lotro_service.py\" --client-lang {clientLang} --tts-lang {ttsLang} --mode {mode} --volume {volume} --stop-hotkey {stopHotkey}" +
+            string args = $"-u \"scripts/lotro_service.py\" --client-lang {clientLang} --tts-lang {ttsLang} --mode {mode} --volume {volume} --speed {speed} --stop-hotkey {stopHotkey}" +
                           (narratorMode ? $" --narrator-mode --narrator-voice {narratorVoice}" : "") +
                           (useMouse ? "" : " --no-mouse");
 
             AppendLog("\n======================================================================", goldAccent);
-            AppendLog($"Starting LOTRO-TTS Service [Client: {clientLang.ToUpperInvariant()} | TTS: {ttsLang.ToUpperInvariant()} | Mode: {mode.ToUpperInvariant()} | Vol: {volume}%]...", goldAccent);
+            AppendLog($"Starting LOTRO-TTS Service [Client: {clientLang.ToUpperInvariant()} | TTS: {ttsLang.ToUpperInvariant()} | Mode: {mode.ToUpperInvariant()} | Vol: {volume}% | Speed: {speed}%]...", goldAccent);
             AppendLog($"[HOTKEY] Press [{stopHotkey.ToUpperInvariant()}], [ESC], or [MOUSE 3] anytime in-game to instantly force-stop dialogue.", goldAccent);
             if (narratorMode)
             {
@@ -1835,9 +1912,11 @@ namespace LotroTtsGui
                 return;
             }
 
+            SaveConfig();
             string ttsLang = GetSelectedCode(cmbTtsLang, "de");
             string mode = GetSelectedCode(cmbComputeMode, "auto");
             int volume = (int)sliderVolume.Value;
+            int speed = Math.Clamp((int)(Math.Round(sliderSpeed.Value / 5.0) * 5), 75, 135);
             string sampleText = "Die Welt ist im Wandel. Ich spüre es im Wasser, ich spüre es in der Erde.";
             if (ttsLang == "en") sampleText = "The world is changed. I feel it in the water, I feel it in the earth.";
             else if (ttsLang == "fr") sampleText = "Le monde a changé. Je le sens dans l'eau, je le sens dans la terre.";
@@ -1845,8 +1924,8 @@ namespace LotroTtsGui
             else if (ttsLang == "it") sampleText = "Il mondo è cambiato. Lo sento nell'acqua, lo sento nella terra.";
             else if (ttsLang == "nl") sampleText = "De wereld is veranderd. Ik voel het in het water, ik voel het in de aarde.";
 
-            string args = $"-u \"scripts/tts_speaker.py\" --npc \"Galadriel\" --lang {ttsLang} --device {mode} --volume {volume} --text \"{sampleText}\"";
-            RunBackgroundToolTask($"Testing TTS Voice Output (Galadriel / {ttsLang.ToUpperInvariant()} / Mode: {mode.ToUpperInvariant()} / Vol: {volume}%)", args);
+            string args = $"-u \"scripts/tts_speaker.py\" --npc \"Galadriel\" --lang {ttsLang} --device {mode} --volume {volume} --speed {speed} --text \"{sampleText}\"";
+            RunBackgroundToolTask($"Testing TTS Voice Output (Galadriel / {ttsLang.ToUpperInvariant()} / Mode: {mode.ToUpperInvariant()} / Vol: {volume}% / Speed: {speed}%)", args);
         }
 
         private async void OnUpdateBadgeClicked(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
