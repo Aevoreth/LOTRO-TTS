@@ -51,11 +51,13 @@ SUPPORTED_TRANSLATION_MODELS = {
 
 
 def _resolve_device(device: str | None) -> str:
-    if device and device != "auto" and device != "cuda":
-        return device
+    mode = (device or "auto").strip().lower()
+    if mode == "cpu":
+        return "cpu"
     try:
-        from tts_speaker import resolve_compute_device
-        return resolve_compute_device(device)
+        from tts_speaker import resolve_compute_profile
+        resolved, low_vram, _ = resolve_compute_profile(mode)
+        return "cpu" if low_vram else resolved
     except Exception:
         import torch
         return "cuda" if torch.cuda.is_available() else "cpu"

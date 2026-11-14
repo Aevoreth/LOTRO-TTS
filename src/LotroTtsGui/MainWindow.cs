@@ -310,7 +310,7 @@ namespace LotroTtsGui
             // Row 0: 4 dropdowns & volume slider
             var row0Grid = new Grid
             {
-                ColumnDefinitions = new ColumnDefinitions("1.1*,8,1.2*,8,0.9*,8,0.9*")
+                ColumnDefinitions = new ColumnDefinitions("1.0*,8,1.15*,8,1.05*,8,0.9*")
             };
 
             // Dropdown 1: Game Client Lang
@@ -341,8 +341,9 @@ namespace LotroTtsGui
             // Dropdown 3: Compute Mode
             cmbComputeMode = CreateDropdown(row0Grid, 0, 4, "Compute Mode:", new[]
             {
-                "auto — Auto (GPU / CPU)",
+                "auto — Auto (GPU / Low-End / CPU)",
                 "cuda — GPU (NVIDIA / AMD)",
+                "low-gpu — Low-End GPU (<= 6 GB)",
                 "cpu — CPU Only"
             });
             cmbComputeMode.SelectionChanged += (s, e) => SaveConfig();
@@ -822,7 +823,12 @@ namespace LotroTtsGui
                         SelectByPrefix(cmbTtsLang, t.GetString()?.ToLowerInvariant() ?? "de");
 
                     if (root.TryGetProperty("compute_mode", out var cm))
-                        SelectByPrefix(cmbComputeMode, cm.GetString()?.ToLowerInvariant() ?? "auto");
+                    {
+                        string cmCode = (cm.GetString() ?? "auto").Trim().ToLowerInvariant();
+                        if (cmCode is "low_vram" or "low-vram" or "low_gpu" or "low-end" or "low_end")
+                            cmCode = "low-gpu";
+                        SelectByPrefix(cmbComputeMode, cmCode);
+                    }
 
                     if (root.TryGetProperty("volume", out var v) && v.TryGetInt32(out int vol))
                     {

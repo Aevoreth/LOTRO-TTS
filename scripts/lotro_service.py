@@ -100,25 +100,29 @@ class LotroPipelineService:
         self.volume = max(0, min(100, int(volume)))
         self.speed = max(50, min(200, int(speed)))
 
-        # Auto-detect CUDA/ROCm GPU and verify kernel execution (falls back to CPU on unsupported GPUs)
-        from tts_speaker import resolve_compute_device
-        device = resolve_compute_device(mode)
+        # Auto-detect CUDA/ROCm GPU (activating Low-End GPU mode <= 6.5 GB VRAM) and verify kernel execution
+        from tts_speaker import resolve_compute_profile
+        device, low_vram, profile_desc = resolve_compute_profile(mode)
+        use_gpu_ocr = (device == "cuda") and (not low_vram)
 
-        logger.info(f"Connecting to Database & Pre-warming OCR: {self.db_path}")
-        self.screen_reader = LotroScreenReader(str(self.db_path), eager_init=True)
+        logger.info(f"Compute Profile: {profile_desc}")
+        logger.info(f"Connecting to Database & Pre-warming OCR ({'CUDA' if use_gpu_ocr else 'CPU'}): {self.db_path}")
+        self.screen_reader = LotroScreenReader(str(self.db_path), eager_init=True, use_gpu_ocr=use_gpu_ocr)
 
-        logger.info(f"Initializing TTS Speaker on device [{device.upper()}] (Voices: {self.voices_dir})")
+        mode_label = f"{device.upper()} / LOW-END GPU" if low_vram else device.upper()
+        logger.info(f"Initializing TTS Speaker on device [{mode_label}] (Voices: {self.voices_dir})")
         self.speaker = LotroSpeaker(
             str(self.voices_dir),
             str(self.db_path),
-            device=device,
+            device=mode,
             narrator_mode=self.narrator_mode,
             narrator_voice=self.narrator_voice,
             volume=self.volume,
             speed=self.speed,
             active_lang=self.tts_lang,
+            low_vram=low_vram,
         )
-        self.translator = LotroTranslator(device=device)
+        self.translator = LotroTranslator(device="cpu" if low_vram else device)
         if self.tts_lang in ("it", "nl"):
             self.translator.preload(self.tts_lang, src_lang=self.game_lang)
 
@@ -874,7 +878,10 @@ def main():
         help=f"Path to LOTRO Documents folder (default: {default_docs})",
     )
     parser.add_argument(
-        "--mode", choices=["auto", "cuda", "cpu"], default="auto", help="Compute mode (auto detects CUDA/RTX)"
+        "--mode",
+        choices=["auto", "cuda", "low-gpu", "low_vram", "cpu"],
+        default="auto",
+        help="Compute mode (auto detects GPU and enables Low-End GPU mode <= 6.5 GB VRAM)",
     )
     parser.add_argument("--no-mouse", action="store_true", help="Disable middle mouse button trigger")
     parser.add_argument("--client-lang", type=str, default=None, help="Force LOTRO game client language (en, de, fr)")

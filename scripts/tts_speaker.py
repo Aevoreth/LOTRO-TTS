@@ -161,21 +161,72 @@ class WarmAudioPlayer:
                 pass
 
 
-def resolve_compute_device(requested_device=None) -> str:
-    """Resolves the compute device ('cuda' or 'cpu') and verifies GPU kernel execution."""
-    if requested_device and requested_device != "auto":
-        if requested_device != "cuda":
-            return requested_device
+LOW_VRAM_THRESHOLD_BYTES = int(6.5 * (1024 ** 3))
+LOW_GPU_MODES = frozenset({"low-gpu", "low_gpu", "low-vram", "low_vram", "low-end", "low_end"})
+
+
+def resolve_compute_profile(
+    requested_device=None,
+    low_vram_threshold_bytes: int = LOW_VRAM_THRESHOLD_BYTES,
+) -> tuple[str, bool, str]:
+    """Resolves (torch_device, low_vram, description) and verifies GPU kernel execution."""
+    mode = (requested_device or "auto").strip().lower()
+    if mode == "cpu":
+        return ("cpu", False, "CPU Only (manual)")
+
     if not torch.cuda.is_available():
-        return "cpu"
+        return ("cpu", False, "CPU fallback (CUDA not available)")
+
     try:
         t = torch.randn(4, 4, device="cuda")
         _ = t @ t
         torch.cuda.synchronize()
-        return "cuda"
+        del t
     except Exception as e:
         print(f"[WARNING] GPU acceleration test failed ({e}). Falling back to CPU!")
-        return "cpu"
+        return ("cpu", False, f"CPU fallback ({e})")
+
+    gpu_name = "GPU"
+    total_vram_bytes = 0
+    try:
+        props = torch.cuda.get_device_properties(0)
+        gpu_name = getattr(props, "name", "GPU") or "GPU"
+        total_vram_bytes = int(getattr(props, "total_memory", 0) or 0)
+    except Exception:
+        pass
+    vram_gb = total_vram_bytes / (1024 ** 3) if total_vram_bytes > 0 else 0.0
+
+    if mode in LOW_GPU_MODES:
+        desc = (
+            f"Low-End GPU ({gpu_name}, {vram_gb:.1f} GB VRAM — manual)"
+            if total_vram_bytes > 0
+            else f"Low-End GPU ({gpu_name} — manual)"
+        )
+        return ("cuda", True, desc)
+
+    if mode in ("cuda", "gpu"):
+        desc = (
+            f"CUDA GPU ({gpu_name}, {vram_gb:.1f} GB VRAM — manual)"
+            if total_vram_bytes > 0
+            else f"CUDA GPU ({gpu_name} — manual)"
+        )
+        return ("cuda", False, desc)
+
+    if total_vram_bytes > 0 and total_vram_bytes <= low_vram_threshold_bytes:
+        return ("cuda", True, f"Auto -> Low-End GPU ({gpu_name}, {vram_gb:.1f} GB VRAM <= 6.5 GB)")
+
+    desc = (
+        f"Auto -> CUDA GPU ({gpu_name}, {vram_gb:.1f} GB VRAM)"
+        if total_vram_bytes > 0
+        else f"Auto -> CUDA GPU ({gpu_name})"
+    )
+    return ("cuda", False, desc)
+
+
+def resolve_compute_device(requested_device=None) -> str:
+    """Resolves the PyTorch compute device ('cuda' or 'cpu') and verifies GPU kernel execution."""
+    device, _, _ = resolve_compute_profile(requested_device)
+    return device
 
 
 class LotroSpeaker:
@@ -189,6 +240,7 @@ class LotroSpeaker:
         volume: int = 80,
         speed: int = 100,
         active_lang: str | None = None,
+        low_vram: bool | None = None,
     ):
         self.base_dir = Path(__file__).resolve().parent.parent
         self.voices_dir = self.base_dir / voices_dir
@@ -207,8 +259,10 @@ class LotroSpeaker:
             self._config_vol_mtime = None
         self._db_local = threading.local()
 
-        self.device = resolve_compute_device(device)
-        print(f"Initializing LOTRO-TTS Speaker Engine on [{self.device}]...")
+        resolved_device, detected_low_vram, profile_desc = resolve_compute_profile(device)
+        self.device = resolved_device
+        self.low_vram = (bool(low_vram) if low_vram is not None else detected_low_vram) and (self.device == "cuda")
+        print(f"Initializing LOTRO-TTS Speaker Engine on [{self.device}] ({profile_desc})...")
 
         # Initialize audio backend and register WASAPI audio session with OS mixer immediately (0.01s silent warmup)
         try:
@@ -224,8 +278,17 @@ class LotroSpeaker:
         # Load OmniVoice model once (FP16 half-precision on CUDA for 2x faster Tensor Core inference)
         model_dtype = torch.float16 if self.device == "cuda" else torch.float32
         self.model = OmniVoice.from_pretrained("k2-fsa/OmniVoice", torch_dtype=model_dtype)
-        self.model = self.model.to(self.device)
-        print(f"OmniVoice model loaded successfully (dtype: {model_dtype})!")
+        if self.device == "cuda" and self.low_vram and getattr(self.model, "audio_tokenizer", None) is not None:
+            # Keep FP32 audio_tokenizer (~764 MiB + ~1.3 GiB prompt-encode spike) on CPU;
+            # OmniVoice routes encode/decode via self.audio_tokenizer.device.
+            audio_tok = self.model.audio_tokenizer
+            del self.model.audio_tokenizer
+            self.model = self.model.to(self.device)
+            self.model.audio_tokenizer = audio_tok
+        else:
+            self.model = self.model.to(self.device)
+        tok_note = " | audio_tokenizer: cpu" if (self.device == "cuda" and self.low_vram) else ""
+        print(f"OmniVoice model loaded successfully (dtype: {model_dtype}{tok_note})!")
 
         # Cache of pre-encoded VoiceClonePrompt objects & reference audio durations
         self._prompt_cache = {}
@@ -344,6 +407,8 @@ class LotroSpeaker:
                         ref_l = "fr" if (l == "fr" and cand.get("is_native_french", True)) else ("en" if l != "de" else "de")
                         self._get_voice_prompt_and_duration(narr_id, ref_l, p_path, cand["text"])
             print("TTS engine pre-warmed and narrator voices ready for instant playback!")
+            if self.low_vram and self.device == "cuda":
+                torch.cuda.empty_cache()
             # Launch background daemon worker to pre-cache frequent voice prompts (0ms encounter latency)
             threading.Thread(target=self._background_precache_worker, daemon=True).start()
         except Exception as e:
@@ -628,7 +693,8 @@ class LotroSpeaker:
             prompt = None
             if prompt_file.exists():
                 try:
-                    prompt = VoiceClonePrompt.load(str(prompt_file), map_location=self.device)
+                    prompt_map_loc = "cpu" if self.low_vram else self.device
+                    prompt = VoiceClonePrompt.load(str(prompt_file), map_location=prompt_map_loc)
                 except Exception:
                     prompt = None
 
@@ -985,6 +1051,11 @@ class LotroSpeaker:
                 return cached_wav
             finally:
                 self._is_speaking_event.clear()
+                if self.low_vram and self.device == "cuda":
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
 
     def _stream_speech(self, sentences, voice_id, ref_lang, ref_audio, ref_text, lang, category, final_cached_wav):
         """Generates and plays sentences sequentially with zero wait-time between chunks and instant cancellation support."""
@@ -1249,7 +1320,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, default=None, help="Output wav file path")
     parser.add_argument("--volume", type=int, default=80, help="Volume percentage (0-100)")
     parser.add_argument("--speed", type=int, default=100, help="Speech speed percentage (75-135, default: 100)")
-    parser.add_argument("--device", type=str, choices=["auto", "cuda", "cpu"], default=None, help="Compute device (default: auto-detect cuda/cpu)")
+    parser.add_argument("--device", type=str, choices=["auto", "cuda", "low-gpu", "low_vram", "cpu"], default=None, help="Compute mode (default: auto-detect)")
 
     args = parser.parse_args()
     speaker = LotroSpeaker(device=args.device, volume=args.volume, speed=args.speed, active_lang=args.lang)

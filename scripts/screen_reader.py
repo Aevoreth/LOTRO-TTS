@@ -140,7 +140,7 @@ class PlayerInfo:
 
 
 class LotroScreenReader:
-    def __init__(self, db_path: Optional[str] = None, eager_init: bool = True):
+    def __init__(self, db_path: Optional[str] = None, eager_init: bool = True, use_gpu_ocr: bool = True):
         if db_path is None:
             base_dir = Path(__file__).resolve().parent.parent
             self.db_path = base_dir / "data" / "lotro.db"
@@ -148,6 +148,7 @@ class LotroScreenReader:
             self.db_path = Path(db_path)
 
         self.ocr_engine = None
+        self.use_gpu_ocr = bool(use_gpu_ocr)
         self._ocr_on_cuda = False
         self.cached_window_box: Optional[Tuple[int, int, int, int]] = None
         self.cached_title_strip: Optional[Tuple[int, int, int, int]] = None
@@ -249,24 +250,25 @@ class LotroScreenReader:
             print(f"[LotroScreenReader] Quest index preload notice: {e}", file=sys.stderr)
 
     def _init_ocr(self):
-        """Pre-warms and initializes RapidOCR engine with true CUDA HEURISTIC execution when available."""
+        """Pre-warms and initializes RapidOCR engine (CUDA HEURISTIC when enabled, else CPU)."""
         if self.ocr_engine is None:
             import numpy as np
             import onnxruntime as ort
             from rapidocr_onnxruntime import RapidOCR
 
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch_lib = Path(torch.__file__).parent / "lib"
-                    if torch_lib.exists():
-                        os.environ["PATH"] = str(torch_lib) + ";" + os.environ.get("PATH", "")
-                        try:
-                            os.add_dll_directory(str(torch_lib))
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+            if self.use_gpu_ocr:
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch_lib = Path(torch.__file__).parent / "lib"
+                        if torch_lib.exists():
+                            os.environ["PATH"] = str(torch_lib) + ";" + os.environ.get("PATH", "")
+                            try:
+                                os.add_dll_directory(str(torch_lib))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
             # Disable 180-degree angle classifier and width/height ratio det-bypass bug
             self.ocr_engine = RapidOCR(
@@ -279,7 +281,7 @@ class LotroScreenReader:
 
             # RapidOCR 1.2.x UpdateParameters ignores rec_use_cuda and uses EXHAUSTIVE cuDNN search;
             # attach CUDAExecutionProvider with HEURISTIC search directly for instant GPU inference.
-            if "CUDAExecutionProvider" in ort.get_available_providers():
+            if self.use_gpu_ocr and "CUDAExecutionProvider" in ort.get_available_providers():
                 try:
                     ep = [
                         (
@@ -312,6 +314,8 @@ class LotroScreenReader:
                 except Exception as e:
                     print(f"[LotroScreenReader] CUDA OCR provider fallback to CPU: {e}", file=sys.stderr)
                     self._ocr_on_cuda = False
+            else:
+                self._ocr_on_cuda = False
 
             # Pre-warm detector and recognizer (including full batch=6 shape)
             try:
